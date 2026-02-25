@@ -62,7 +62,7 @@ The `coderlog` package is the importable core. It exposes:
 |---|---|---|---|
 | `--source` | Yes | — | Log source name |
 | `--icon` | No | `""` | Icon URL |
-| `--level` | No | `info` | Log level (trace/debug/info/warn/error/fatal) |
+| `--level` | No | `info` | Log level (trace/debug/info/warn/error) |
 
 Trailing args are sent as a single message; if no args, reads stdin with batching.
 

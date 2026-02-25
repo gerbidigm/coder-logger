@@ -112,7 +112,7 @@ func cmdSend(args []string) {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
 	source := fs.String("source", "", "Log source name (required)")
 	icon := fs.String("icon", "", "Icon URL for the log source")
-	level := fs.String("level", "info", "Log level: trace, debug, info, warn, error, fatal")
+	level := fs.String("level", "info", "Log level: trace, debug, info, warn, error")
 	fs.Parse(args)
 
 	if *source == "" {

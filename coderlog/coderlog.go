@@ -45,7 +45,6 @@ const (
 	LogLevelInfo  LogLevel = "info"
 	LogLevelWarn  LogLevel = "warn"
 	LogLevelError LogLevel = "error"
-	LogLevelFatal LogLevel = "fatal"
 )
 
 // LogEntry is a single log line sent to the agent.
