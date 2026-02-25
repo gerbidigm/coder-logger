@@ -68,12 +68,13 @@ Trailing args are sent as a single message; if no args, reads stdin with batchin
 
 # Essential Commands
 
-- **Build:** `go build ./...`
-- **Build binary:** `go build -o coder-logger ./cmd/coder-logger`
+- **Build (all targets):** `mage build` — cross-compiles to `dist/` for linux/amd64, linux/arm64, darwin/arm64.
+- **Build (local only):** `mage buildLocal`
+- **Build (go only):** `go build ./...`
 - **Format:** `gofmt -w .`
-- **Lint:** `go vet ./...`
-- **Test:** `go test ./...`
-- **Clean:** `rm -f coder-logger`
+- **Lint:** `mage lint` or `go vet ./...`
+- **Test:** `mage test` or `go test ./...`
+- **Clean:** `mage clean` — removes `dist/`
 
 # Commit and Pull Request Guidelines
 
