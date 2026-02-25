@@ -1,42 +1,52 @@
-// Package coderlog provides a client for streaming logs to the Coder Agent
-// startup log API. It can be used as a library or via the coder-logger CLI.
+// Package coderlog provides a client for streaming log lines to Coder workspace
+// startup logs via the Agent API. It is designed to be imported as a library or
+// used via the coder-logger CLI.
 //
-// The package registers a log source with the Coder workspace agent, then
-// streams log lines (from a file or programmatically) to appear in the
-// workspace's startup logs in the Coder UI.
+// Key design decisions:
+//   - Deterministic UUID v5 IDs derived from source names (same name → same ID).
+//   - Token-scoped file cache prevents redundant register calls and detects overflow.
+//   - Auto-register on send — no mandatory register step.
+//   - 1 MiB cumulative log limit per workspace build; overflow is cached to avoid
+//     wasted API calls after the limit is hit.
 package coderlog
 
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+// Fixed namespace for deterministic UUID v5 generation from source names.
+// Generated once; do not change.
+var logSourceUUIDNamespace = uuid.MustParse("a0c8f2e4-0b3a-4d6e-9f1a-2b7c5d8e0f3a")
+
+// LogSourceIDFromName derives a deterministic UUID v5 from a source name.
+// The same name always produces the same ID, which the Coder API accepts.
+func LogSourceIDFromName(name string) uuid.UUID {
+	return uuid.NewSHA1(logSourceUUIDNamespace, []byte(name))
+}
+
 // LogLevel represents the severity of a log entry.
 type LogLevel string
 
 const (
-	LogLevelTrace   LogLevel = "trace"
-	LogLevelDebug   LogLevel = "debug"
-	LogLevelInfo    LogLevel = "info"
-	LogLevelWarn    LogLevel = "warn"
-	LogLevelError   LogLevel = "error"
-	LogLevelFatal   LogLevel = "fatal"
+	LogLevelTrace LogLevel = "trace"
+	LogLevelDebug LogLevel = "debug"
+	LogLevelInfo  LogLevel = "info"
+	LogLevelWarn  LogLevel = "warn"
+	LogLevelError LogLevel = "error"
+	LogLevelFatal LogLevel = "fatal"
 )
-
-// Source identifies a log source registered with the Coder agent.
-type Source struct {
-	ID          uuid.UUID `json:"id"`
-	DisplayName string    `json:"display_name"`
-	Icon        string    `json:"icon"`
-}
 
 // LogEntry is a single log line sent to the agent.
 type LogEntry struct {
@@ -51,27 +61,27 @@ type patchLogsRequest struct {
 	Logs        []LogEntry `json:"logs"`
 }
 
+// postLogSourceRequest is the payload for the POST /log-source endpoint.
+type postLogSourceRequest struct {
+	ID          uuid.UUID `json:"id"`
+	DisplayName string    `json:"display_name"`
+	Icon        string    `json:"icon"`
+}
+
+// ErrOverflow is returned when the 1 MiB agent log limit has been exceeded.
+var ErrOverflow = fmt.Errorf("agent log limit (1 MiB) exceeded — no further logs can be sent until the next workspace build")
+
 // Client sends logs to the Coder workspace agent API.
 type Client struct {
 	// AgentURL is the base URL for the Coder deployment (CODER_AGENT_URL).
 	AgentURL string
 	// AgentToken is the workspace agent session token (CODER_AGENT_TOKEN).
 	AgentToken string
+	// CacheDir is the root config directory for the token-scoped cache.
+	// If empty, caching is disabled.
+	CacheDir string
 	// HTTPClient is optional; http.DefaultClient is used if nil.
 	HTTPClient *http.Client
-
-	// FlushInterval controls how often buffered logs are sent.
-	// Defaults to 250ms if zero.
-	FlushInterval time.Duration
-	// BatchSize is the max number of log lines per request.
-	// Defaults to 100 if zero.
-	BatchSize int
-
-	mu      sync.Mutex
-	buf     []LogEntry
-	source  *Source
-	cancel  context.CancelFunc
-	done    chan struct{}
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -81,38 +91,67 @@ func (c *Client) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-func (c *Client) flushInterval() time.Duration {
-	if c.FlushInterval > 0 {
-		return c.FlushInterval
+// scopeDir returns the token-scoped cache directory path.
+func (c *Client) scopeDir() string {
+	if c.CacheDir == "" {
+		return ""
 	}
-	return 250 * time.Millisecond
+	h := sha256.Sum256([]byte(c.AgentToken))
+	scope := hex.EncodeToString(h[:8])
+	return filepath.Join(c.CacheDir, "log-sources", scope)
 }
 
-func (c *Client) batchSize() int {
-	if c.BatchSize > 0 {
-		return c.BatchSize
+// CheckOverflow returns ErrOverflow if the overflow sentinel exists.
+func (c *Client) CheckOverflow() error {
+	dir := c.scopeDir()
+	if dir == "" {
+		return nil
 	}
-	return 100
+	if _, err := os.Stat(filepath.Join(dir, ".overflow")); err == nil {
+		return ErrOverflow
+	}
+	return nil
 }
 
-// RegisterSource creates a new log source with the Coder agent.
-// It must be called before sending any logs.
-func (c *Client) RegisterSource(ctx context.Context, displayName, icon string) (*Source, error) {
-	src := &Source{
-		ID:          uuid.New(),
-		DisplayName: displayName,
-		Icon:        icon,
+func (c *Client) markOverflow() {
+	dir := c.scopeDir()
+	if dir == "" {
+		return
+	}
+	_ = os.MkdirAll(dir, 0o700)
+	_ = os.WriteFile(filepath.Join(dir, ".overflow"), nil, 0o600)
+}
+
+// EnsureSource registers a log source if it hasn't been cached yet.
+// Uses deterministic UUID v5 from the source name. Idempotent — the Coder API
+// accepts re-registration of the same source ID.
+func (c *Client) EnsureSource(ctx context.Context, name, icon string) (uuid.UUID, error) {
+	if err := c.CheckOverflow(); err != nil {
+		return uuid.Nil, err
 	}
 
-	body, err := json.Marshal(src)
+	id := LogSourceIDFromName(name)
+
+	// Check cache.
+	dir := c.scopeDir()
+	if dir != "" {
+		marker := filepath.Join(dir, name)
+		if _, err := os.Stat(marker); err == nil {
+			return id, nil // already registered
+		}
+	}
+
+	// Register via API.
+	payload := postLogSourceRequest{ID: id, DisplayName: name, Icon: icon}
+	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("marshal source: %w", err)
+		return uuid.Nil, fmt.Errorf("marshal source: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/api/v2/workspaceagents/me/log-source", c.AgentURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return uuid.Nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -120,94 +159,41 @@ func (c *Client) RegisterSource(ctx context.Context, displayName, icon string) (
 
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("register log source: %w", err)
+		return uuid.Nil, fmt.Errorf("register log source: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("register log source: HTTP %d: %s", resp.StatusCode, string(respBody))
+		return uuid.Nil, fmt.Errorf("register log source: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	c.mu.Lock()
-	c.source = src
-	c.mu.Unlock()
-
-	return src, nil
-}
-
-// Send enqueues a single log entry. Logs are batched and flushed periodically
-// once StartFlusher is called, or can be flushed manually with Flush.
-func (c *Client) Send(level LogLevel, output string) {
-	entry := LogEntry{
-		CreatedAt: time.Now().UTC(),
-		Level:     level,
-		Output:    output,
+	// Write cache marker.
+	if dir != "" {
+		_ = os.MkdirAll(dir, 0o700)
+		_ = os.WriteFile(filepath.Join(dir, name), nil, 0o600)
 	}
-	c.mu.Lock()
-	c.buf = append(c.buf, entry)
-	c.mu.Unlock()
+
+	return id, nil
 }
 
-// StartFlusher begins a background goroutine that periodically sends buffered
-// logs. Call Close to stop flushing and send remaining logs.
-func (c *Client) StartFlusher(ctx context.Context) {
-	ctx, c.cancel = context.WithCancel(ctx)
-	c.done = make(chan struct{})
-
-	go func() {
-		defer close(c.done)
-		ticker := time.NewTicker(c.flushInterval())
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				// Final flush.
-				_ = c.Flush(context.Background())
-				return
-			case <-ticker.C:
-				_ = c.Flush(ctx)
-			}
-		}
-	}()
-}
-
-// Flush sends all buffered log entries immediately.
-func (c *Client) Flush(ctx context.Context) error {
-	c.mu.Lock()
-	if len(c.buf) == 0 || c.source == nil {
-		c.mu.Unlock()
-		return nil
+// SendLines sends one or more log lines immediately (no batching).
+// Returns ErrOverflow if the 1 MiB limit is hit (HTTP 413).
+func (c *Client) SendLines(ctx context.Context, sourceID uuid.UUID, level LogLevel, lines []string) error {
+	if err := c.CheckOverflow(); err != nil {
+		return err
 	}
-	entries := c.buf
-	c.buf = nil
-	src := c.source
-	c.mu.Unlock()
 
-	// Send in batches.
-	bs := c.batchSize()
-	for i := 0; i < len(entries); i += bs {
-		end := i + bs
-		if end > len(entries) {
-			end = len(entries)
-		}
-		if err := c.sendBatch(ctx, src.ID, entries[i:end]); err != nil {
-			// Re-enqueue unsent entries.
-			c.mu.Lock()
-			c.buf = append(entries[end:], c.buf...)
-			c.mu.Unlock()
-			return err
+	entries := make([]LogEntry, len(lines))
+	for i, line := range lines {
+		entries[i] = LogEntry{
+			CreatedAt: time.Now().UTC(),
+			Level:     level,
+			Output:    line,
 		}
 	}
-	return nil
-}
 
-func (c *Client) sendBatch(ctx context.Context, sourceID uuid.UUID, entries []LogEntry) error {
-	payload := patchLogsRequest{
-		LogSourceID: sourceID,
-		Logs:        entries,
-	}
+	payload := patchLogsRequest{LogSourceID: sourceID, Logs: entries}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal logs: %w", err)
@@ -228,18 +214,13 @@ func (c *Client) sendBatch(ctx context.Context, sourceID uuid.UUID, entries []Lo
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		c.markOverflow()
+		return ErrOverflow
+	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("send logs: HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-	return nil
-}
-
-// Close stops the background flusher and sends any remaining buffered logs.
-func (c *Client) Close() error {
-	if c.cancel != nil {
-		c.cancel()
-		<-c.done
 	}
 	return nil
 }

@@ -23,19 +23,22 @@ go.mod, go.sum       Module definition
 
 ### Important Files
 
-- `coderlog/coderlog.go` — `Client` struct: register log source, batch & flush log entries via Coder Agent API.
-- `coderlog/tail.go` — `TailFile()`: watches a file for new lines and streams them.
-- `cmd/coder-logger/main.go` — CLI: parses flags, reads stdin or tails a file.
+- `coderlog/coderlog.go` — `Client` struct: EnsureSource (register + cache), SendLines, overflow detection via Coder Agent API.
+- `coderlog/stream.go` — `StreamReader()`: batched stdin/reader streaming (50 lines / 250ms flush).
+- `cmd/coder-logger/main.go` — CLI with `register` and `send` subcommands.
 
 ### Architecture
 
 The `coderlog` package is the importable core. It exposes:
 
-- `Client` — configured with `AgentURL` and `AgentToken`, handles HTTP calls to:
+- `Client` — configured with `AgentURL`, `AgentToken`, and `CacheDir`, handles HTTP calls to:
   - `POST /api/v2/workspaceagents/me/log-source` (register a source)
   - `PATCH /api/v2/workspaceagents/me/logs` (send log entries)
-- `TailFile()` — file-following helper that feeds lines into a `Client`.
-- The CLI (`cmd/coder-logger`) is a thin wrapper that wires flags/env vars to the package.
+- `LogSourceIDFromName()` — deterministic UUID v5 from source name (same name → same ID).
+- `StreamReader()` — batched reader streaming helper.
+- **Token-scoped cache** under `$CONFIG_DIR/log-sources/<sha256(token)[:16]>/` prevents redundant API calls.
+- **Overflow detection** — HTTP 413 → `.overflow` sentinel → blocks future sends until next build.
+- The CLI (`cmd/coder-logger`) is a thin wrapper with `register` and `send` subcommands.
 
 ### Environment Variables
 
@@ -44,14 +47,24 @@ The `coderlog` package is the importable core. It exposes:
 | `CODER_AGENT_URL` | Yes | Base URL of the Coder deployment |
 | `CODER_AGENT_TOKEN` | Yes | Workspace agent session token |
 
-### CLI Flags
+### CLI Commands
 
-| Flag | Default | Description |
-|---|---|---|
-| `--log-file` | _(stdin)_ | Path to a log file to tail |
-| `--source-name` | `cloud_init` | Display name for the log source |
-| `--source-icon` | cloud-init SVG | Icon URL for the log source |
-| `--level` | `info` | Log level (trace/debug/info/warn/error/fatal) |
+**`coder-logger register`** — Pre-register a log source (optional).
+
+| Flag | Required | Default | Description |
+|---|---|---|---|
+| `--name` | Yes | — | Log source name |
+| `--icon` | No | `""` | Icon URL |
+
+**`coder-logger send`** — Send log lines (auto-registers the source).
+
+| Flag | Required | Default | Description |
+|---|---|---|---|
+| `--source` | Yes | — | Log source name |
+| `--icon` | No | `""` | Icon URL |
+| `--level` | No | `info` | Log level (trace/debug/info/warn/error/fatal) |
+
+Trailing args are sent as a single message; if no args, reads stdin with batching.
 
 # Essential Commands
 
