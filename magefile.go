@@ -5,9 +5,9 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
@@ -76,8 +76,106 @@ func Test() error {
 	return sh.RunV("go", "test", "./...")
 }
 
-// check that mage binary is available (for CI bootstrapping).
-func ensureMage() error {
-	_, err := exec.LookPath("mage")
-	return err
+// Version prints the current version based on git tags.
+func Version() error {
+	v, err := currentVersion()
+	if err != nil {
+		return err
+	}
+	fmt.Println(v)
+	return nil
+}
+
+// Tag creates and pushes a new semver tag. Accepts "patch", "minor", or "major".
+// Defaults to "patch" if no argument is given.
+//
+// Usage:
+//
+//	mage tag          # bump patch: v0.1.0 → v0.1.1
+//	mage tag:patch    # same as above
+//	mage tag:minor    # bump minor: v0.1.1 → v0.2.0
+//	mage tag:major    # bump major: v0.2.0 → v1.0.0
+type Tag mg.Namespace
+
+// Patch bumps the patch version (v0.1.0 → v0.1.1) and pushes the tag.
+func (Tag) Patch() error { return bumpAndPush("patch") }
+
+// Minor bumps the minor version (v0.1.0 → v0.2.0) and pushes the tag.
+func (Tag) Minor() error { return bumpAndPush("minor") }
+
+// Major bumps the major version (v0.1.0 → v1.0.0) and pushes the tag.
+func (Tag) Major() error { return bumpAndPush("major") }
+
+func currentVersion() (string, error) {
+	out, err := sh.Output("git", "describe", "--tags", "--abbrev=0")
+	if err != nil {
+		// No tags yet.
+		return "v0.0.0", nil
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func bumpAndPush(part string) error {
+	cur, err := currentVersion()
+	if err != nil {
+		return err
+	}
+
+	next, err := bumpVersion(cur, part)
+	if err != nil {
+		return err
+	}
+
+	// Verify working tree is clean.
+	if err := sh.Run("git", "diff", "--quiet", "HEAD"); err != nil {
+		return fmt.Errorf("working tree is dirty — commit or stash changes first")
+	}
+
+	fmt.Printf("Tagging %s → %s\n", cur, next)
+
+	if err := sh.RunV("git", "tag", "-a", next, "-m", "Release "+next); err != nil {
+		return fmt.Errorf("git tag: %w", err)
+	}
+	if err := sh.RunV("git", "push", "origin", next); err != nil {
+		return fmt.Errorf("git push: %w", err)
+	}
+
+	fmt.Printf("Pushed %s — GitHub Actions will create the release.\n", next)
+	return nil
+}
+
+func bumpVersion(version, part string) (string, error) {
+	v := strings.TrimPrefix(version, "v")
+	parts := strings.Split(v, ".")
+
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid version %q: expected vMAJOR.MINOR.PATCH", version)
+	}
+
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(parts[0], "%d", &major); err != nil {
+		return "", fmt.Errorf("parse major: %w", err)
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &minor); err != nil {
+		return "", fmt.Errorf("parse minor: %w", err)
+	}
+	if _, err := fmt.Sscanf(parts[2], "%d", &patch); err != nil {
+		return "", fmt.Errorf("parse patch: %w", err)
+	}
+
+	switch part {
+	case "major":
+		major++
+		minor = 0
+		patch = 0
+	case "minor":
+		minor++
+		patch = 0
+	case "patch":
+		patch++
+	default:
+		return "", fmt.Errorf("unknown bump part %q: use major, minor, or patch", part)
+	}
+
+	return fmt.Sprintf("v%d.%d.%d", major, minor, patch), nil
 }
